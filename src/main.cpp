@@ -104,11 +104,23 @@ bool TakeValue(int argc, wchar_t** argv, int* index, const wchar_t* flag, std::w
     return true;
 }
 
-}  // namespace
+// True when this program is the only thing attached to the console, which
+// means Windows created the window for us because it was started from
+// Explorer. In that case the window - and every message in it - disappears the
+// instant we return, so we wait for a key first.
+bool OwnsConsole() {
+    DWORD processes[2] = {0, 0};
+    return GetConsoleProcessList(processes, 2) <= 1;
+}
 
-int wmain(int argc, wchar_t** argv) {
-    SetConsoleOutputCP(CP_UTF8);
+void PauseIfLaunchedFromExplorer() {
+    if (!OwnsConsole()) return;
+    printf("\nPress Enter to close this window...");
+    fflush(stdout);
+    (void)fgetc(stdin);
+}
 
+int Run(int argc, wchar_t** argv) {
     ma::MirrorOptions options;
     bool wantsList = false;
 
@@ -157,11 +169,7 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     ma::MirrorEngine engine;
-    if (!engine.start(options)) {
-        ma::LogInfo("");
-        ma::LogInfo("Run \"multiaudio --list\" to see the available devices.");
-        return 1;
-    }
+    if (!engine.start(options)) return 1;
 
     ma::LogInfo("Latency: about %d ms behind the source. Press Ctrl+C to stop.",
                 options.latencyMs);
@@ -174,4 +182,13 @@ int wmain(int argc, wchar_t** argv) {
 
     ma::LogInfo("Stopped.");
     return 0;
+}
+
+}  // namespace
+
+int wmain(int argc, wchar_t** argv) {
+    SetConsoleOutputCP(CP_UTF8);
+    const int result = Run(argc, argv);
+    PauseIfLaunchedFromExplorer();
+    return result;
 }

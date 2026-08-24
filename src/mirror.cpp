@@ -381,7 +381,25 @@ bool MirrorEngine::openSinks() {
     }
 
     if (sinks_.empty()) {
-        LogError("nothing to mirror to: no other playback device matched");
+        LogError("nothing to mirror to: no other playback device is available");
+        LogInfo("");
+        LogInfo("Active playback devices Windows reports:");
+        for (const auto& info : devices) {
+            LogInfo("  - %s%s", Utf8(info.name).c_str(),
+                    info.id == sourceInfo_.id ? "   <- the source" : "");
+        }
+        LogInfo("");
+        if (devices.size() <= 1) {
+            LogInfo("Only this one device is active, so there is no second device to");
+            LogInfo("mirror to. Two pairs of headphones plugged into the same sound");
+            LogInfo("card are one device to Windows, and this cannot split them - that");
+            LogInfo("needs a second output: a USB headset, a USB sound card, HDMI, or a");
+            LogInfo("virtual cable. Devices that are disabled or unplugged do not");
+            LogInfo("appear here; check Sound settings > All sound devices.");
+        } else if (!options_.include.empty() || !options_.exclude.empty()) {
+            LogInfo("The --to / --exclude filters left nothing. Drop them, or match one");
+            LogInfo("of the names above.");
+        }
         return false;
     }
     return true;
