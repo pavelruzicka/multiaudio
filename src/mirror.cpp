@@ -207,13 +207,13 @@ private:
     std::atomic<bool> dead_{false};
 };
 
-// ---------------------------------------------------------------------------
-// Watches for devices being plugged in, removed, or made default.
+// Watches for devices being plugged in, removed, or made default. Every
+// notification simply pokes the engine, which works out what changed.
 // ---------------------------------------------------------------------------
 class DeviceChangeNotifier : public IMMNotificationClient {
 public:
-    DeviceChangeNotifier(std::atomic<bool>* changed, bool followDefault)
-        : changed_(changed), followDefault_(followDefault) {}
+    DeviceChangeNotifier(MirrorEngine* engine, bool followDefault)
+        : engine_(engine), followDefault_(followDefault) {}
 
     virtual ~DeviceChangeNotifier() = default;
 
@@ -238,19 +238,19 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override {
-        signal();
+        engine_->notifyDevicesChanged();
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override {
-        signal();
+        engine_->notifyDevicesChanged();
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override {
-        signal();
+        engine_->notifyDevicesChanged();
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override {
-        if (followDefault_ && flow == eRender && role == eConsole) signal();
+        if (followDefault_ && flow == eRender && role == eConsole) engine_->notifyDevicesChanged();
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override {
@@ -258,79 +258,219 @@ public:
     }
 
 private:
-    void signal() { changed_->store(true, std::memory_order_relaxed); }
-
     LONG refCount_ = 1;
-    std::atomic<bool>* changed_;
+    MirrorEngine* engine_;
     bool followDefault_;
 };
 
 // ---------------------------------------------------------------------------
 // MirrorEngine
 // ---------------------------------------------------------------------------
+namespace {
+constexpr DWORD kServiceTickMs = 500;    // how often the engine looks around
+constexpr DWORD kOpenRetryMs = 10000;    // wait this long before retrying a device
+}  // namespace
+
 MirrorEngine::MirrorEngine() {
-    stopEvent_.attach(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    wakeEvent_.attach(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+    captureStopEvent_.attach(CreateEventW(nullptr, TRUE, FALSE, nullptr));
 }
 
 MirrorEngine::~MirrorEngine() {
+    requestStop();
+    if (serviceThread_ && serviceThread_->joinable()) serviceThread_->join();
+    serviceThread_.reset();
     closeStreams();
     if (notifier_ && enumerator_) {
         enumerator_->UnregisterEndpointNotificationCallback(notifier_.get());
     }
 }
 
-bool MirrorEngine::start(const MirrorOptions& options) {
-    options_ = options;
+void MirrorEngine::setOptions(const MirrorOptions& options) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        options_ = options;
+    }
+    optionsChanged_.store(true, std::memory_order_relaxed);
+    if (wakeEvent_) SetEvent(wakeEvent_.get());
+}
 
-    if (!enumerator_ && !CreateDeviceEnumerator(&enumerator_)) return false;
+MirrorOptions MirrorEngine::options() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return options_;
+}
 
-    if (!notifier_) {
-        // The constructor starts the object at one reference, which the
-        // ComPtr now owns.
-        notifier_.attach(new DeviceChangeNotifier(&devicesChanged_, options_.followDefault));
-        const HRESULT hr = enumerator_->RegisterEndpointNotificationCallback(notifier_.get());
-        if (FAILED(hr)) {
-            LogVerbose("device change notifications unavailable: %s", HrText(hr).c_str());
+void MirrorEngine::setEnabled(bool enabled) {
+    enabled_.store(enabled, std::memory_order_relaxed);
+    if (wakeEvent_) SetEvent(wakeEvent_.get());
+}
+
+EngineStatus MirrorEngine::status() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return status_;
+}
+
+void MirrorEngine::setStatusCallback(std::function<void()> callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    onStatusChanged_ = std::move(callback);
+}
+
+void MirrorEngine::notifyDevicesChanged() {
+    devicesChanged_.store(true, std::memory_order_relaxed);
+    if (wakeEvent_) SetEvent(wakeEvent_.get());
+}
+
+void MirrorEngine::requestStop() {
+    stopRequested_.store(true, std::memory_order_relaxed);
+    captureRunning_.store(false, std::memory_order_relaxed);
+    if (captureStopEvent_) SetEvent(captureStopEvent_.get());
+    if (wakeEvent_) SetEvent(wakeEvent_.get());
+}
+
+void MirrorEngine::startBackground() {
+    serviceThread_ = std::make_unique<std::thread>([this] { serviceLoop(); });
+}
+
+void MirrorEngine::runForeground() { serviceLoop(); }
+
+void MirrorEngine::serviceLoop() {
+    ComApartment com;  // the engine and its threads live in the MTA
+
+    while (!stopRequested_.load(std::memory_order_relaxed)) {
+        service();
+        WaitForSingleObject(wakeEvent_.get(), kServiceTickMs);
+    }
+
+    closeStreams();
+    publish(EngineState::Off, {});
+}
+
+// One pass of the state machine. Everything it needs may be missing - no audio
+// service, no default device, nothing else plugged in - and none of that is an
+// error: it just means there is nothing to do yet.
+void MirrorEngine::service() {
+    if (stopRequested_.load(std::memory_order_relaxed)) return;
+
+    if (!enabled_.load(std::memory_order_relaxed)) {
+        closeStreams();
+        publish(EngineState::Off, {});
+        return;
+    }
+
+    if (!ensureEnumerator()) {
+        publish(EngineState::Waiting, L"waiting for the Windows audio service");
+        return;
+    }
+
+    // A different source or latency means rebuilding everything, because the
+    // destinations are built around the source format. Switching a destination
+    // on or off in the menu only needs the destinations resynced, which leaves
+    // the devices already playing undisturbed.
+    if (optionsChanged_.exchange(false, std::memory_order_relaxed)) {
+        const MirrorOptions current = options();
+        const bool rebuild = current.source != appliedOptions_.source ||
+                             current.latencyMs != appliedOptions_.latencyMs ||
+                             current.followDefault != appliedOptions_.followDefault;
+        appliedOptions_ = current;
+        sinkRetryAt_.clear();
+        if (rebuild) {
+            closeStreams();
+        } else {
+            devicesChanged_.store(true, std::memory_order_relaxed);
         }
     }
 
-    if (!openSource()) return false;
-    if (!openSinks()) {
-        closeStreams();
-        return false;
+    const bool devicesChanged = devicesChanged_.exchange(false, std::memory_order_relaxed);
+    if (devicesChanged) sinkRetryAt_.clear();  // a change is worth an immediate retry
+
+    if (captureFailed_.load(std::memory_order_relaxed)) closeStreams();
+
+    // Following the default device means noticing when it moves.
+    if (devicesChanged && captureService_) {
+        const MirrorOptions current = options();
+        if (current.followDefault && (current.source.empty() || current.source == L"default")) {
+            DeviceInfo preferred;
+            if (ResolveRenderDevice(enumerator_.get(), L"default", &preferred) &&
+                preferred.id != sourceInfo_.id) {
+                closeStreams();
+            }
+        }
     }
 
-    captureFailed_.store(false, std::memory_order_relaxed);
-    running_.store(true, std::memory_order_relaxed);
-    captureThread_ = std::make_unique<std::thread>([this] { captureLoop(); });
+    if (!captureService_ && !openSource()) {
+        publish(EngineState::Waiting, sourceMessage_.empty()
+                                          ? L"waiting for a playback device to mirror from"
+                                          : sourceMessage_);
+        return;
+    }
+
+    bool anyDead = false;
+    {
+        std::lock_guard<std::mutex> lock(sinksMutex_);
+        for (const auto& sink : sinks_) {
+            if (sink->dead()) anyDead = true;
+        }
+        if (sinks_.empty()) anyDead = true;  // keep looking while there is nowhere to play
+    }
+    if (devicesChanged || anyDead) syncSinks();
+
+    size_t count = 0;
+    {
+        std::lock_guard<std::mutex> lock(sinksMutex_);
+        count = sinks_.size();
+    }
+    if (count == 0) {
+        publish(EngineState::Waiting, L"waiting for a second playback device");
+    } else {
+        publish(EngineState::Mirroring, {});
+    }
+}
+
+bool MirrorEngine::ensureEnumerator() {
+    if (enumerator_) return true;
+    if (!CreateDeviceEnumerator(&enumerator_)) return false;
+
+    const MirrorOptions current = options();
+    notifier_.attach(new DeviceChangeNotifier(this, current.followDefault));
+    const HRESULT hr = enumerator_->RegisterEndpointNotificationCallback(notifier_.get());
+    if (FAILED(hr)) {
+        LogVerbose("device change notifications unavailable: %s", HrText(hr).c_str());
+    }
     return true;
 }
 
 bool MirrorEngine::openSource() {
-    if (!ResolveRenderDevice(enumerator_.get(), options_.source, &sourceInfo_)) return false;
+    const MirrorOptions current = options();
+
+    sourceMessage_.clear();
+    if (!ResolveRenderDevice(enumerator_.get(), current.source, &sourceInfo_, &sourceMessage_)) {
+        return false;
+    }
 
     ComPtr<IMMDevice> device;
     if (!GetRenderDeviceById(enumerator_.get(), sourceInfo_.id, &device)) {
-        LogError("the source device disappeared before it could be opened");
+        sourceMessage_ = L"the device to mirror from disappeared";
         return false;
     }
 
     HRESULT hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                                   captureClient_.put_void());
     if (FAILED(hr)) {
-        LogError("cannot open the source device: %s", HrText(hr).c_str());
+        LogVerbose("cannot open the source device: %s", HrText(hr).c_str());
+        captureClient_.reset();
         return false;
     }
 
     CoMem<WAVEFORMATEX> mixFormat;
     hr = captureClient_->GetMixFormat(mixFormat.put());
     if (FAILED(hr) || !DescribeFormat(mixFormat.get(), &sourceFormat_)) {
-        LogError("cannot use the audio format of the source device");
+        LogVerbose("cannot use the audio format of the source device");
+        captureClient_.reset();
         return false;
     }
 
-    // A generous capture buffer: the loopback stream is polled, and a late
-    // poll should not cost us any audio.
+    // A generous capture buffer: the loopback stream is polled, and a late poll
+    // should not cost us any audio.
     const REFERENCE_TIME duration = 500 * kMsToRefTime;
     hr = captureClient_->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
                                     duration, 0, mixFormat.get(), nullptr);
@@ -339,71 +479,133 @@ bool MirrorEngine::openSource() {
     }
     if (SUCCEEDED(hr)) hr = captureClient_->Start();
     if (FAILED(hr)) {
-        LogError("cannot capture from \"%s\": %s", Utf8(sourceInfo_.name).c_str(),
-                 HrText(hr).c_str());
+        LogVerbose("cannot capture from \"%s\": %s", Utf8(sourceInfo_.name).c_str(),
+                   HrText(hr).c_str());
+        captureService_.reset();
+        captureClient_.reset();
         return false;
     }
 
-    LogInfo("Source: %s  [%s]", Utf8(sourceInfo_.name).c_str(),
-            FormatSummary(sourceFormat_).c_str());
+    captureFailed_.store(false, std::memory_order_relaxed);
+    captureRunning_.store(true, std::memory_order_relaxed);
+    ResetEvent(captureStopEvent_.get());
+    captureThread_ = std::make_unique<std::thread>([this] { captureLoop(); });
+
+    LogVerbose("capturing from %s [%s]", Utf8(sourceInfo_.name).c_str(),
+               FormatSummary(sourceFormat_).c_str());
     return true;
 }
 
-bool MirrorEngine::openSinks() {
+void MirrorEngine::closeSource() {
+    captureRunning_.store(false, std::memory_order_relaxed);
+    if (captureStopEvent_) SetEvent(captureStopEvent_.get());
+    if (captureThread_ && captureThread_->joinable()) captureThread_->join();
+    captureThread_.reset();
+
+    if (captureClient_) captureClient_->Stop();
+    captureService_.reset();
+    captureClient_.reset();
+    captureFailed_.store(false, std::memory_order_relaxed);
+    sourceInfo_ = DeviceInfo{};
+}
+
+// Brings the set of open destinations in line with what is plugged in and
+// wanted. Devices that appear are added without disturbing the ones already
+// playing; devices that vanish are dropped.
+void MirrorEngine::syncSinks() {
+    const MirrorOptions current = options();
+
     std::vector<DeviceInfo> devices;
-    if (!ListRenderDevices(enumerator_.get(), &devices)) return false;
+    if (!ListRenderDevices(enumerator_.get(), &devices)) return;
 
+    std::vector<DeviceInfo> wanted;
     for (const auto& info : devices) {
-        if (info.id == sourceInfo_.id) continue;  // never mirror a device back into itself
+        if (info.id == sourceInfo_.id) continue;  // never mirror a device into itself
 
-        bool wanted = options_.include.empty();
-        for (const auto& pattern : options_.include) {
-            if (ContainsNoCase(info.name, pattern)) wanted = true;
+        bool include = current.include.empty();
+        for (const auto& pattern : current.include) {
+            if (ContainsNoCase(info.name, pattern)) include = true;
         }
-        for (const auto& pattern : options_.exclude) {
-            if (ContainsNoCase(info.name, pattern)) wanted = false;
+        for (const auto& pattern : current.exclude) {
+            if (ContainsNoCase(info.name, pattern)) include = false;
         }
-        if (!wanted) {
-            LogVerbose("skipping %s", Utf8(info.name).c_str());
-            continue;
+        for (const auto& id : current.excludeIds) {
+            if (info.id == id) include = false;
         }
+        if (include) wanted.push_back(info);
+    }
+
+    // Drop the ones that are gone, unwanted, or have stopped working. Stopping
+    // a stream joins its thread, so do that outside the lock.
+    std::vector<std::unique_ptr<SinkStream>> doomed;
+    {
+        std::lock_guard<std::mutex> lock(sinksMutex_);
+        for (size_t i = sinks_.size(); i > 0; --i) {
+            auto& sink = sinks_[i - 1];
+            const bool stillWanted =
+                !sink->dead() && std::any_of(wanted.begin(), wanted.end(),
+                                             [&](const DeviceInfo& device) {
+                                                 return device.id == sink->info().id;
+                                             });
+            if (!stillWanted) {
+                doomed.push_back(std::move(sink));
+                sinks_.erase(sinks_.begin() + static_cast<ptrdiff_t>(i - 1));
+            }
+        }
+    }
+    for (auto& sink : doomed) {
+        LogVerbose("dropping %s", Utf8(sink->info().name).c_str());
+        sink->stop();
+    }
+    doomed.clear();
+
+    // Add the ones we do not have yet. Opening a device can take a moment, so
+    // it happens outside the lock as well.
+    const ULONGLONG now = GetTickCount64();
+    for (const auto& info : wanted) {
+        bool alreadyOpen = false;
+        {
+            std::lock_guard<std::mutex> lock(sinksMutex_);
+            for (const auto& sink : sinks_) {
+                if (sink->info().id == info.id) alreadyOpen = true;
+            }
+        }
+        if (alreadyOpen) continue;
+
+        // A device held in exclusive mode by another program will not open;
+        // do not hammer it every half second.
+        const auto retry = sinkRetryAt_.find(info.id);
+        if (retry != sinkRetryAt_.end() && now < retry->second) continue;
 
         ComPtr<IMMDevice> device;
         if (!GetRenderDeviceById(enumerator_.get(), info.id, &device)) continue;
 
         auto sink = std::make_unique<SinkStream>(std::move(device), info);
-        if (!sink->open(sourceFormat_, options_.latencyMs)) continue;
+        if (!sink->open(sourceFormat_, current.latencyMs)) {
+            sinkRetryAt_[info.id] = now + kOpenRetryMs;
+            continue;
+        }
+        sinkRetryAt_.erase(info.id);
+        LogVerbose("mirroring to %s [%s]", Utf8(info.name).c_str(),
+                   FormatSummary(sink->format()).c_str());
 
-        const StreamFormat& format = sink->format();
-        const char* note = "";
-        if (format.sampleRate != sourceFormat_.sampleRate) note = "  (resampled)";
-        LogInfo("  -> %s  [%s]%s", Utf8(info.name).c_str(), FormatSummary(format).c_str(), note);
+        std::lock_guard<std::mutex> lock(sinksMutex_);
         sinks_.push_back(std::move(sink));
     }
+}
 
-    if (sinks_.empty()) {
-        LogError("nothing to mirror to: no other playback device is available");
-        LogInfo("");
-        LogInfo("Active playback devices Windows reports:");
-        for (const auto& info : devices) {
-            LogInfo("  - %s%s", Utf8(info.name).c_str(),
-                    info.id == sourceInfo_.id ? "   <- the source" : "");
-        }
-        LogInfo("");
-        if (devices.size() <= 1) {
-            LogInfo("Only this one device is active, so there is no second device to");
-            LogInfo("mirror to. Two pairs of headphones plugged into the same sound");
-            LogInfo("card are one device to Windows, and this cannot split them - that");
-            LogInfo("needs a second output: a USB headset, a USB sound card, HDMI, or a");
-            LogInfo("virtual cable. Devices that are disabled or unplugged do not");
-            LogInfo("appear here; check Sound settings > All sound devices.");
-        } else if (!options_.include.empty() || !options_.exclude.empty()) {
-            LogInfo("The --to / --exclude filters left nothing. Drop them, or match one");
-            LogInfo("of the names above.");
-        }
-        return false;
+void MirrorEngine::closeSinks() {
+    std::vector<std::unique_ptr<SinkStream>> closing;
+    {
+        std::lock_guard<std::mutex> lock(sinksMutex_);
+        closing.swap(sinks_);
     }
-    return true;
+    for (auto& sink : closing) sink->stop();
+}
+
+void MirrorEngine::closeStreams() {
+    closeSource();
+    closeSinks();
 }
 
 void MirrorEngine::captureLoop() {
@@ -412,9 +614,9 @@ void MirrorEngine::captureLoop() {
     DWORD taskIndex = 0;
     HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
 
-    const DWORD pollMs = static_cast<DWORD>(std::max(1, options_.latencyMs / 4));
+    const DWORD pollMs = static_cast<DWORD>(std::max(1, options().latencyMs / 4));
 
-    while (running_.load(std::memory_order_relaxed)) {
+    while (captureRunning_.load(std::memory_order_relaxed)) {
         UINT32 packetFrames = 0;
         HRESULT hr = captureService_->GetNextPacketSize(&packetFrames);
         if (FAILED(hr)) {
@@ -423,7 +625,7 @@ void MirrorEngine::captureLoop() {
             break;
         }
 
-        while (packetFrames > 0 && running_.load(std::memory_order_relaxed)) {
+        while (packetFrames > 0 && captureRunning_.load(std::memory_order_relaxed)) {
             BYTE* data = nullptr;
             UINT32 frames = 0;
             DWORD flags = 0;
@@ -443,6 +645,7 @@ void MirrorEngine::captureLoop() {
                 } else {
                     ConvertToFloat(data, sourceFormat_, frames, captureScratch_.data());
                 }
+                std::lock_guard<std::mutex> lock(sinksMutex_);
                 for (auto& sink : sinks_) {
                     sink->push(captureScratch_.data(), frames);
                 }
@@ -452,74 +655,31 @@ void MirrorEngine::captureLoop() {
             if (FAILED(captureService_->GetNextPacketSize(&packetFrames))) break;
         }
 
-        WaitForSingleObject(stopEvent_.get(), pollMs);
+        WaitForSingleObject(captureStopEvent_.get(), pollMs);
     }
 
     if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
+    if (captureFailed_.load(std::memory_order_relaxed) && wakeEvent_) SetEvent(wakeEvent_.get());
 }
 
-void MirrorEngine::closeStreams() {
-    // The capture thread polls at a fraction of the latency, so clearing the
-    // flag is enough to bring it down promptly.
-    running_.store(false, std::memory_order_relaxed);
-    if (captureThread_ && captureThread_->joinable()) captureThread_->join();
-    captureThread_.reset();
-
-    for (auto& sink : sinks_) sink->stop();
-    sinks_.clear();
-
-    if (captureClient_) captureClient_->Stop();
-    captureService_.reset();
-    captureClient_.reset();
-}
-
-void MirrorEngine::run() {
-    while (!stopRequested_.load(std::memory_order_relaxed)) {
-        WaitForSingleObject(stopEvent_.get(), 500);
-        if (stopRequested_.load(std::memory_order_relaxed)) break;
-
-        bool reopen = devicesChanged_.load(std::memory_order_relaxed) ||
-                      captureFailed_.load(std::memory_order_relaxed);
-        for (const auto& sink : sinks_) {
-            if (sink->dead()) reopen = true;
-        }
-        if (!reopen) continue;
-
-        // Device changes arrive in bursts (a USB headset appears as several
-        // notifications); let them settle before reopening anything.
-        WaitForSingleObject(stopEvent_.get(), 800);
-        if (stopRequested_.load(std::memory_order_relaxed)) break;
-
-        LogInfo("");
-        LogInfo("Playback devices changed, reconnecting...");
-        closeStreams();
-
-        bool waitingAnnounced = false;
-        while (!stopRequested_.load(std::memory_order_relaxed)) {
-            devicesChanged_.store(false, std::memory_order_relaxed);
-            if (start(options_)) break;
-            closeStreams();
-            if (!waitingAnnounced) {
-                LogInfo("Waiting for a usable playback device...");
-                waitingAnnounced = true;
-            }
-            WaitForSingleObject(stopEvent_.get(), 2000);
-        }
+void MirrorEngine::publish(EngineState state, std::wstring message) {
+    EngineStatus fresh;
+    fresh.state = state;
+    fresh.message = std::move(message);
+    if (state != EngineState::Off) {
+        fresh.source = sourceInfo_.name;
+        std::lock_guard<std::mutex> lock(sinksMutex_);
+        for (const auto& sink : sinks_) fresh.sinks.push_back(sink->info().name);
     }
 
-    for (const auto& sink : sinks_) {
-        if (sink->underruns() > 0) {
-            LogVerbose("%s: %llu buffer underruns", Utf8(sink->info().name).c_str(),
-                       sink->underruns());
-        }
+    std::function<void()> callback;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_ == fresh) return;
+        status_ = std::move(fresh);
+        callback = onStatusChanged_;
     }
-    closeStreams();
-}
-
-void MirrorEngine::requestStop() {
-    stopRequested_.store(true, std::memory_order_relaxed);
-    running_.store(false, std::memory_order_relaxed);
-    if (stopEvent_) SetEvent(stopEvent_.get());
+    if (callback) callback();
 }
 
 }  // namespace ma

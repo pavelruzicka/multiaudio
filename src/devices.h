@@ -29,9 +29,11 @@ bool GetDefaultRenderDevice(IMMDeviceEnumerator* enumerator, ComPtr<IMMDevice>* 
 bool GetRenderDeviceById(IMMDeviceEnumerator* enumerator, const std::wstring& id,
                          ComPtr<IMMDevice>* out);
 
-// Resolves "default", a 1-based index from --list, or a name substring.
-// Returns false and explains why if nothing (or more than one thing) matches.
+// Resolves an endpoint id, "default", a 1-based index from --list, or a name
+// substring. On failure `reason` (when given) is filled in with something worth
+// showing the user; nothing is logged, because callers may be asking
+// repeatedly while they wait for a device to appear.
 bool ResolveRenderDevice(IMMDeviceEnumerator* enumerator, const std::wstring& spec,
-                         DeviceInfo* out);
+                         DeviceInfo* out, std::wstring* reason = nullptr);
 
 }  // namespace ma

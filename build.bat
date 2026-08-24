@@ -16,10 +16,11 @@ if errorlevel 1 (
 
 if not exist build mkdir build
 
-cl /nologo /std:c++17 /EHsc /O2 /W3 /DUNICODE /D_UNICODE ^
+cl /nologo /std:c++17 /EHsc /O2 /W3 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS ^
    /Fe:build\multiaudio.exe /Fo:build\ ^
-   src\main.cpp src\mirror.cpp src\devices.cpp src\audio.cpp src\util.cpp ^
-   ole32.lib avrt.lib
+   src\main.cpp src\tray.cpp src\mirror.cpp src\devices.cpp src\audio.cpp ^
+   src\settings.cpp src\install.cpp src\util.cpp ^
+   /link /SUBSYSTEM:WINDOWS ole32.lib avrt.lib shell32.lib user32.lib gdi32.lib advapi32.lib
 if errorlevel 1 exit /b 1
 
 echo.

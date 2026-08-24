@@ -21,7 +21,7 @@ bool CreateDeviceEnumerator(ComPtr<IMMDeviceEnumerator>* out) {
     const HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                                         __uuidof(IMMDeviceEnumerator), enumerator.put_void());
     if (FAILED(hr)) {
-        LogError("could not talk to the Windows audio device enumerator: %s", HrText(hr).c_str());
+        LogVerbose("no audio device enumerator: %s", HrText(hr).c_str());
         return false;
     }
     *out = std::move(enumerator);
@@ -61,7 +61,7 @@ bool ListRenderDevices(IMMDeviceEnumerator* enumerator, std::vector<DeviceInfo>*
     ComPtr<IMMDeviceCollection> collection;
     HRESULT hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, collection.put());
     if (FAILED(hr)) {
-        LogError("could not list playback devices: %s", HrText(hr).c_str());
+        LogVerbose("could not list playback devices: %s", HrText(hr).c_str());
         return false;
     }
 
@@ -91,7 +91,7 @@ bool GetDefaultRenderDevice(IMMDeviceEnumerator* enumerator, ComPtr<IMMDevice>* 
     ComPtr<IMMDevice> device;
     const HRESULT hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, device.put());
     if (FAILED(hr)) {
-        LogError("no default playback device available: %s", HrText(hr).c_str());
+        LogVerbose("no default playback device: %s", HrText(hr).c_str());
         return false;
     }
     *out = std::move(device);
@@ -109,14 +109,26 @@ bool GetRenderDeviceById(IMMDeviceEnumerator* enumerator, const std::wstring& id
 }
 
 bool ResolveRenderDevice(IMMDeviceEnumerator* enumerator, const std::wstring& spec,
-                         DeviceInfo* out) {
+                         DeviceInfo* out, std::wstring* reason) {
+    auto explain = [reason](std::wstring text) {
+        if (reason) *reason = std::move(text);
+        return false;
+    };
+
     if (!enumerator || !out) return false;
 
     std::vector<DeviceInfo> devices;
-    if (!ListRenderDevices(enumerator, &devices)) return false;
-    if (devices.empty()) {
-        LogError("no active playback devices found");
-        return false;
+    if (!ListRenderDevices(enumerator, &devices)) {
+        return explain(L"the Windows audio service is not answering");
+    }
+    if (devices.empty()) return explain(L"no playback device is plugged in");
+
+    // An exact endpoint id, as stored by the tray menu.
+    for (const auto& device : devices) {
+        if (device.id == spec) {
+            *out = device;
+            return true;
+        }
     }
 
     if (spec.empty() || spec == L"default") {
@@ -137,9 +149,7 @@ bool ResolveRenderDevice(IMMDeviceEnumerator* enumerator, const std::wstring& sp
             *out = devices[static_cast<size_t>(index) - 1];
             return true;
         }
-        LogError("device number %ld is out of range (run with --list to see 1..%zu)", index,
-                 devices.size());
-        return false;
+        return explain(L"there is no playback device number " + std::to_wstring(index));
     }
 
     // Otherwise match the friendly name.
@@ -147,15 +157,10 @@ bool ResolveRenderDevice(IMMDeviceEnumerator* enumerator, const std::wstring& sp
     for (const auto& device : devices) {
         if (ContainsNoCase(device.name, spec)) matches.push_back(&device);
     }
-    if (matches.empty()) {
-        LogError("no playback device matches \"%s\" (run with --list to see the names)",
-                 Utf8(spec).c_str());
-        return false;
-    }
+    if (matches.empty()) return explain(L"no playback device matches \"" + spec + L"\"");
     if (matches.size() > 1) {
-        LogError("\"%s\" matches %zu devices; be more specific:", Utf8(spec).c_str(), matches.size());
-        for (const auto* device : matches) LogError("  %s", Utf8(device->name).c_str());
-        return false;
+        return explain(L"\"" + spec + L"\" matches " + std::to_wstring(matches.size()) +
+                       L" devices - be more specific");
     }
     *out = *matches.front();
     return true;

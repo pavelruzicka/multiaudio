@@ -3,8 +3,8 @@
 Play the same sound through **every** output device at once, so two pairs of
 headphones (or headphones + speakers) hear the same thing.
 
-A small console program: about 1,700 lines of C++ with no dependencies beyond
-Windows itself. No installer, no driver, no admin rights.
+A small tray app: one executable, about 3,000 lines of C++ with no dependencies
+beyond Windows itself. No installer to download, no driver, no admin rights.
 
 ```
 > multiaudio
@@ -30,84 +30,96 @@ your normal device, and the other devices join in.
 
 If you do want a device named something neutral like "All Headphones" in the
 Windows list, pair this with a free virtual cable driver — see
-[Setup B](#setup-b-with-a-virtual-cable) below. `multiaudio` then does the
+[a virtual cable](#feeding-everything-equally-with-a-virtual-cable) below. `multiaudio` then does the
 fan-out part that the cable does not do.
 
-## Quick start
+## Install it
 
-Build it (see [Building](#building)), then:
+Download or build `multiaudio.exe` and run it. The first time, it offers to
+install itself: it copies into `%LOCALAPPDATA%\Programs\multiaudio`, adds a
+Start Menu entry, and starts with Windows from then on. Everything is per-user,
+so no admin rights are involved, and the tray menu can undo all of it.
 
-```
-multiaudio --list      show the playback devices
-multiaudio             mirror the default device to all the others
-```
+From a command line, `multiaudio --install` and `multiaudio --uninstall` do the
+same without asking.
 
-Plug in both pairs of headphones, run `multiaudio`, and play something. Ctrl+C
-stops it. Each device keeps its own volume slider in the Windows volume mixer,
-so that is where you balance them.
-
-### Setup A: no install (default)
-
-Your normal playback device stays the default. Windows plays to it as usual;
-`multiaudio` copies that audio to every other device.
+Then it lives in the notification area. Click the icon:
 
 ```
-multiaudio                                mirror to everything else
-multiaudio --to "HyperX" --to "Realtek"   mirror to just these two
-multiaudio --exclude "HDMI"               mirror everywhere except HDMI
-multiaudio --source 2                     mirror device 2 from --list
+  ✓ Enabled
+  ─────────────────────────────
+  Mirroring Speakers (Realtek) to 2 devices
+      Headset Earphone (HyperX)
+      Digital Output (S/PDIF)
+  ─────────────────────────────
+  Mirror from   ▸   ● Windows default device
+  Mirror to     ▸   ✓ Headset Earphone (HyperX)
+  Latency       ▸     15 / 25 / ● 40 / 80 / 150 ms
+  ─────────────────────────────
+  ✓ Start with Windows
+  Uninstall...
+  ─────────────────────────────
+  Exit
 ```
 
-The one asymmetry: the source device plays with no added delay, and the
-mirrored devices are ~40 ms behind it. Two people wearing separate headphones
-will not notice. If both outputs are audible in the same room, lower it with
-`--latency 15`, or use Setup B.
+The icon is blue while audio is being mirrored and grey when it is off or
+waiting; hovering over it shows what it is doing. Double-clicking toggles it.
+Your choices are remembered in `HKCU\Software\multiaudio`.
 
-### Setup B: with a virtual cable
+## Plugging things in later
 
-If you want a device to select in Windows that feeds *all* of your real
-outputs equally:
+Nothing has to be plugged in when it starts, which matters when it starts with
+Windows and the USB devices are still enumerating. The engine keeps watching:
+
+* Start it with one pair of headphones plugged in and it waits. Plug in the
+  second pair and mirroring begins on its own, a moment later.
+* Unplug a pair and it drops out; the rest carry on playing.
+* A device that appears is added **without interrupting** the ones already
+  playing, and so is switching a destination on or off in the menu.
+* Change the default playback device and it follows.
+* If a device is held in exclusive mode by another program, it is skipped and
+  retried every ten seconds rather than hammered.
+
+Nothing in that list is an error state: the icon just goes grey and the tooltip
+says what it is waiting for.
+
+## Running it in a console instead
+
+The same executable is still a command line tool, for setting things up and for
+seeing what Windows reports:
+
+```
+multiaudio --list                          show the playback devices
+multiaudio --console                       mirror in this window until Ctrl+C
+multiaudio --console --to "USB"            mirror to just the matching devices
+multiaudio --console --exclude "HDMI"      mirror everywhere but HDMI
+multiaudio --source "CABLE Input"          mirror a virtual cable to everything
+multiaudio --latency 15                    tighter, more likely to crackle
+```
+
+Full list with `multiaudio --help`. Name matching is case-insensitive and
+matches any part of the name, so `--to hyperx` is enough for "Headset Earphone
+(HyperX Cloud II)". Volume is per device: use the Windows volume mixer to
+balance them.
+
+## Feeding everything equally, with a virtual cable
+
+If you want a device to select in Windows that feeds *all* of your real outputs
+equally, rather than one real device leading and the others following ~40 ms
+behind:
 
 1. Install [VB-CABLE](https://vb-audio.com/Cable/) (free, signed driver).
    It adds a playback device called **CABLE Input**.
 2. Make **CABLE Input** the default playback device.
-3. Run:
+3. Pick it under **Mirror from** in the tray menu.
 
-   ```
-   multiaudio --source "CABLE Input"
-   ```
-
-Now everything Windows plays goes into the cable, and `multiaudio` fans it out
-to every real device with identical latency — nothing is "first". Rename
-CABLE Input to "All Outputs" in Sound settings if you like.
-
-## Options
-
-```
---list                 Show the playback devices and exit.
---source <device>      Device to mirror from: "default", a number from --list,
-                       or part of a device name. Default: the Windows default.
---to <name>            Only mirror to devices whose name contains <name>.
-                       Repeatable. Default: every other playback device.
---exclude <name>       Never mirror to devices matching <name>. Repeatable.
---latency <ms>         How far the mirrored devices lag the source, 5-500.
-                       Lower is tighter but more likely to crackle.
-                       Default: 40.
---no-follow-default    Do not reconnect when the default device changes.
---verbose              Print extra detail.
---help                 Show help.
-```
-
-Name matching is case-insensitive and matches any part of the name, so
-`--to hyperx` is enough for "Headset Earphone (HyperX Cloud II)".
-
-Devices can be plugged in and unplugged while it runs: the streams are
-reopened automatically a moment later, and new devices are picked up.
+Everything Windows plays now goes into the cable, and `multiaudio` fans it out
+to every real device with identical latency - nothing is "first".
 
 ## Building
 
-Nothing to install beyond a compiler; it links only `ole32` and `avrt`, both
-part of Windows.
+Nothing to install beyond a compiler; it links only libraries that ship with
+Windows (`ole32`, `avrt`, `shell32`, `user32`, `gdi32`, `advapi32`).
 
 **Visual Studio** — from an *x64 Native Tools Command Prompt*:
 
@@ -125,8 +137,9 @@ cmake --build build --config Release
 **MinGW-w64**, including cross-compiling from Linux:
 
 ```
-x86_64-w64-mingw32-g++ -std=c++17 -municode -O2 -static \
-    -o multiaudio.exe src/*.cpp -lole32 -lavrt
+x86_64-w64-mingw32-g++ -std=c++17 -municode -mwindows -O2 -static \
+    -o multiaudio.exe src/*.cpp \
+    -lole32 -lavrt -lshell32 -luser32 -lgdi32 -ladvapi32
 ```
 
 Windows 7 or newer (Vista-era APIs only), 32- or 64-bit.
@@ -174,9 +187,17 @@ behave. `ctest` runs it too.
   converted per device, so a 44.1 kHz S/PDIF output and a 48 kHz USB headset
   can run from the same 48 kHz source.
 
-Source layout: `main.cpp` (command line), `mirror.cpp` (capture + the sink
-streams, the interesting part), `devices.cpp` (endpoint enumeration),
-`audio.cpp` (format conversion), `ring_buffer.h`, `util.h`.
+The engine is written as a service rather than a pipeline that is set up once:
+one pass of its state machine runs twice a second, opens whatever is missing,
+drops whatever has gone, and publishes what it is doing. Every part of what it
+needs is allowed to be absent.
+
+Source layout: `main.cpp` (entry point and command line), `tray.cpp` (the
+notification-area app), `mirror.cpp` (capture, the destination streams and the
+service loop - the interesting part), `devices.cpp` (endpoint enumeration),
+`audio.cpp` (format conversion), `settings.cpp` (what is remembered),
+`install.cpp` (installing without an installer), plus the header-only
+`resampler.h`, `channel_map.h`, `ring_buffer.h` and `util.h`.
 
 ## Troubleshooting
 
