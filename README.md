@@ -41,7 +41,8 @@ Start Menu entry, and starts with Windows from then on. Everything is per-user,
 so no admin rights are involved, and the tray menu can undo all of it.
 
 From a command line, `multiaudio --install` and `multiaudio --uninstall` do the
-same without asking.
+same without asking. Starting with Windows is a shortcut in your Startup folder
+(`Win+R`, `shell:startup`), so it is somewhere you can see it and delete it.
 
 Then it lives in the notification area. Click the icon:
 
@@ -65,6 +66,37 @@ Then it lives in the notification area. Click the icon:
 The icon is blue while audio is being mirrored and grey when it is off or
 waiting; hovering over it shows what it is doing. Double-clicking toggles it.
 Your choices are remembered in `HKCU\Software\multiaudio`.
+
+## If Windows Defender quarantines it
+
+A generic machine-learning detection such as `Trojan:Script/Wacatac.B!ml` is
+the usual verdict on an executable that is unsigned, built with MinGW and
+statically linked. It is a judgement about the shape of the file, not about
+anything the program did: the quarantine happens on the downloaded file, before
+it has ever run.
+
+The dependable answer is to **build it yourself** from this repository - see
+[Building](#building). Binaries from the Visual Studio compiler trip this far
+less often, and you know what went into them. That is a better position to be
+in than trusting a stranger's binary, whatever the scanner says about it.
+
+If you would rather run a downloaded copy, restoring it is Windows Security →
+Protection history → the item → Actions → Restore. Whether to do that is a
+judgement about where the file came from, and only you can make it.
+
+Reporting it helps: Microsoft's [false-positive
+submission](https://www.microsoft.com/en-us/wdsi/filesubmission) is usually
+turned around in a day or two.
+
+The lasting fix is an Authenticode signature, which also stops SmartScreen
+warning about the program having no reputation. Microsoft's Azure Trusted
+Signing is the least painful route for an individual publisher.
+
+For what it is worth, this program does do two things that a heuristic scanner
+is entitled to be suspicious of: it copies itself into your program folder, and
+it arranges to start with Windows. Both are visible and reversible - the copy
+lands in `%LOCALAPPDATA%\Programs\multiaudio`, the startup entry is a shortcut
+in your Startup folder, and `--uninstall` removes both.
 
 ## Plugging things in later
 
@@ -94,7 +126,7 @@ multiaudio --console                       mirror in this window until Ctrl+C
 multiaudio --console --to "USB"            mirror to just the matching devices
 multiaudio --console --exclude "HDMI"      mirror everywhere but HDMI
 multiaudio --source "CABLE Input"          mirror a virtual cable to everything
-multiaudio --latency 15                    tighter, more likely to crackle
+multiaudio --console --latency 80          more headroom, if it crackles
 ```
 
 Full list with `multiaudio --help`. Name matching is case-insensitive and
@@ -187,6 +219,36 @@ behave. `ctest` runs it too.
   converted per device, so a 44.1 kHz S/PDIF output and a 48 kHz USB headset
   can run from the same 48 kHz source.
 
+### How low the latency goes
+
+Zero is not on the table, and not because of any detail of this program: a
+mirrored device is downstream of the source's mix, so the audio has to be
+captured before it can be played again. The floor is set by three things.
+
+| Where the delay is | Roughly |
+| --- | --- |
+| Loopback capture picking up the mix | one audio-engine period, ~10 ms |
+| Waiting in our ring, absorbing jitter and clock drift | half the setting, at least 15 ms |
+| Queued at the destination device | half the setting, at least 2 periods |
+
+The two floors are what stop it going lower, and both come from the Windows
+shared-mode audio engine's 10 ms period rather than from anything here. In
+practice that puts the floor around **35-45 ms**, and settings below that do
+very little.
+
+Getting meaningfully under that needs a different kind of stream:
+
+* `IAudioClient3` shared-mode streams can run a 2.67 ms period where the
+  driver supports it, which would bring the total into the 10-15 ms range.
+* Exclusive-mode destinations are lower still, at the price of the device
+  becoming unusable by every other program - including the Windows volume
+  mixer.
+
+Neither is implemented. If you want them, they are the next thing to do.
+
+The number the tray tooltip shows is measured from the buffers actually in use,
+not the setting you asked for, so it tells you what you are really getting.
+
 The engine is written as a service rather than a pipeline that is set up once:
 one pass of its state machine runs twice a second, opens whatever is missing,
 drops whatever has gone, and publishes what it is doing. Every part of what it
@@ -227,8 +289,9 @@ in Sound settings is a normal shared-mode format.
 * Everything is shared-mode. A program that takes a device in exclusive mode
   (WASAPI exclusive, ASIO) is invisible to loopback capture and its device
   cannot be used as a destination while it is held.
-* Mirrored devices lag the source by `--latency`. This is not an A/V sync
-  problem for the source device itself, which is untouched.
+* Mirrored devices lag the source; see [How low the latency
+  goes](#how-low-the-latency-goes). The source device itself is untouched, so
+  this is not an A/V sync problem for whoever is listening on it.
 
 ## License
 

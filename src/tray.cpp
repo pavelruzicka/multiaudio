@@ -277,7 +277,8 @@ std::wstring TrayApp::statusLine() const {
     }
     const size_t count = status.sinks.size();
     return L"Mirroring " + status.source + L" to " + std::to_wstring(count) +
-           (count == 1 ? L" device" : L" devices");
+           (count == 1 ? L" device" : L" devices") + L", " +
+           std::to_wstring(status.latencyMs) + L" ms behind";
 }
 
 void TrayApp::refreshIcon() {

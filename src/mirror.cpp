@@ -34,6 +34,15 @@ public:
 
     const DeviceInfo& info() const { return info_; }
     const StreamFormat& format() const { return sinkFormat_; }
+
+    // What this device is actually behind the source by, in milliseconds:
+    // everything waiting in the ring plus everything queued at the device.
+    int latencyMs() const {
+        if (!sinkFormat_.valid() || !sourceFormat_.valid()) return 0;
+        const double ring = 1000.0 * static_cast<double>(targetFrames_) / sourceFormat_.sampleRate;
+        const double queued = 1000.0 * queueFrames_ / sinkFormat_.sampleRate;
+        return static_cast<int>(ring + queued + 0.5);
+    }
     bool dead() const { return dead_.load(std::memory_order_relaxed); }
     unsigned long long underruns() const { return resampler_.underruns(); }
 
@@ -54,10 +63,16 @@ public:
             return false;
         }
 
-        // Ask for a buffer twice the target latency so a late wake-up does not
-        // immediately starve the device.
+        // The buffer is capacity, not delay: how full it is kept is what the
+        // listener actually hears (see queueFrames_ below). Ask for room to
+        // spare so a late wake-up has somewhere to catch up into.
+        REFERENCE_TIME devicePeriod = 0;
+        REFERENCE_TIME minimumPeriod = 0;
+        client_->GetDevicePeriod(&devicePeriod, &minimumPeriod);
+
         const REFERENCE_TIME duration =
-            static_cast<REFERENCE_TIME>(latencyMs) * 2 * kMsToRefTime;
+            std::max<REFERENCE_TIME>(static_cast<REFERENCE_TIME>(latencyMs) * 2 * kMsToRefTime,
+                                     devicePeriod * 6);
         hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                  duration, 0, mixFormat.get(), nullptr);
         if (FAILED(hr)) {
@@ -82,11 +97,30 @@ public:
             return false;
         }
 
-        // How much audio to keep buffered ahead of this device.
-        size_t targetFrames =
-            static_cast<size_t>(sourceFormat_.sampleRate) * static_cast<size_t>(latencyMs) / 1000;
+        // The latency budget is spent in two places, and both of them are
+        // delay the listener hears: audio waiting in our own ring, and audio
+        // already queued at the device. Half each.
+        //
+        // The ring has to hold at least a couple of capture packets, which
+        // arrive one audio-engine period at a time, or it runs dry between
+        // them. The device queue has to hold at least two periods, or a late
+        // wake-up is an audible gap. Those two floors, not this setting, are
+        // what stops the latency going lower.
+        const UINT32 periodFrames = devicePeriod > 0
+                                        ? static_cast<UINT32>(devicePeriod *
+                                                              sinkFormat_.sampleRate / 10000000)
+                                        : sinkFormat_.sampleRate / 100;
+
+        queueFrames_ = std::max<UINT32>(
+            2 * periodFrames,
+            static_cast<UINT32>(sinkFormat_.sampleRate) * static_cast<UINT32>(latencyMs) / 2000);
+        queueFrames_ = std::min(queueFrames_, bufferFrames_);
+
+        size_t targetFrames = static_cast<size_t>(sourceFormat_.sampleRate) *
+                              static_cast<size_t>(std::max(latencyMs / 2, 15)) / 1000;
         if (targetFrames < 64) targetFrames = 64;
 
+        targetFrames_ = targetFrames;
         ring_.reset(sourceFormat_.channels,
                     std::max<size_t>(targetFrames * 6, sourceFormat_.sampleRate));
         resampler_.configure(sourceFormat_.channels, sourceFormat_.sampleRate,
@@ -96,11 +130,12 @@ public:
         resampled_.assign(static_cast<size_t>(bufferFrames_) * sourceFormat_.channels, 0.0f);
         mapped_.assign(static_cast<size_t>(bufferFrames_) * sinkFormat_.channels, 0.0f);
 
-        // Hand the device a buffer of silence before starting so it has
-        // something to play while the first audio arrives.
+        // Prime with silence up to the queue level - not the whole buffer,
+        // which would put the entire capacity in front of the first real audio
+        // and never drain again.
         BYTE* buffer = nullptr;
-        if (SUCCEEDED(renderService_->GetBuffer(bufferFrames_, &buffer))) {
-            renderService_->ReleaseBuffer(bufferFrames_, AUDCLNT_BUFFERFLAGS_SILENT);
+        if (SUCCEEDED(renderService_->GetBuffer(queueFrames_, &buffer))) {
+            renderService_->ReleaseBuffer(queueFrames_, AUDCLNT_BUFFERFLAGS_SILENT);
         }
 
         hr = client_->Start();
@@ -145,8 +180,11 @@ private:
                 fail(hr);
                 break;
             }
-            if (bufferFrames_ <= padding) continue;
-            const UINT32 frames = bufferFrames_ - padding;
+            // Top the device up to the queue level and no further. Filling
+            // every free frame would keep the whole buffer ahead of the
+            // listener, which is latency nobody asked for.
+            if (padding >= queueFrames_) continue;
+            const UINT32 frames = std::min<UINT32>(queueFrames_ - padding, bufferFrames_ - padding);
 
             BYTE* buffer = nullptr;
             hr = renderService_->GetBuffer(frames, &buffer);
@@ -194,10 +232,13 @@ private:
     Handle event_;
     UINT32 bufferFrames_ = 0;
 
+    UINT32 queueFrames_ = 0;  // how much audio to keep queued at the device
+
     StreamFormat sourceFormat_;
     StreamFormat sinkFormat_;
 
     FrameRing ring_;             // source-rate float frames, filled by the capture thread
+    size_t targetFrames_ = 0;    // how much the ring holds back
     DriftResampler resampler_;   // source rate -> this device's rate
     std::vector<float> resampled_;
     std::vector<float> mapped_;
@@ -614,7 +655,9 @@ void MirrorEngine::captureLoop() {
     DWORD taskIndex = 0;
     HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
 
-    const DWORD pollMs = static_cast<DWORD>(std::max(1, options().latencyMs / 4));
+    // Loopback capture cannot be event-driven, so it is polled. Poll well
+    // inside the ring's headroom: this wait is pure added delay.
+    const DWORD pollMs = static_cast<DWORD>(std::min(10, std::max(1, options().latencyMs / 8)));
 
     while (captureRunning_.load(std::memory_order_relaxed)) {
         UINT32 packetFrames = 0;
@@ -669,7 +712,10 @@ void MirrorEngine::publish(EngineState state, std::wstring message) {
     if (state != EngineState::Off) {
         fresh.source = sourceInfo_.name;
         std::lock_guard<std::mutex> lock(sinksMutex_);
-        for (const auto& sink : sinks_) fresh.sinks.push_back(sink->info().name);
+        for (const auto& sink : sinks_) {
+            fresh.sinks.push_back(sink->info().name);
+            fresh.latencyMs = std::max(fresh.latencyMs, sink->latencyMs());
+        }
     }
 
     std::function<void()> callback;

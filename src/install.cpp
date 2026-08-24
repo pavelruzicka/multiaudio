@@ -8,12 +8,32 @@ namespace ma {
 namespace {
 
 constexpr wchar_t kAppName[] = L"multiaudio";
-constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+// Startup is a shortcut in the user's Startup folder rather than a value under
+// the Run key. Both are standard, but a shortcut is somewhere people can see
+// and delete it, and a program that copies itself somewhere and then writes a
+// Run key looks exactly like malware to a heuristic scanner.
+constexpr wchar_t kLegacyRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 std::wstring KnownFolder(int folder) {
     wchar_t path[MAX_PATH] = {0};
     if (FAILED(SHGetFolderPathW(nullptr, folder, nullptr, SHGFP_TYPE_CURRENT, path))) return {};
     return path;
+}
+
+std::wstring StartupShortcutPath() {
+    const std::wstring startup = KnownFolder(CSIDL_STARTUP);
+    if (startup.empty()) return {};
+    return startup + L"\\" + kAppName + L".lnk";
+}
+
+// Older versions started themselves from the Run key; take it away again.
+void RemoveLegacyRunEntry() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kLegacyRunKey, 0, KEY_WRITE, &key) != ERROR_SUCCESS) {
+        return;
+    }
+    RegDeleteValueW(key, kAppName);
+    RegCloseKey(key);
 }
 
 std::wstring ShortcutPath() {
@@ -127,13 +147,14 @@ bool Install(bool startWithWindows, std::wstring* message) {
     if (message) {
         *message = L"Installed to " + target;
         if (shortcutMade) *message += L"\nAdded to the Start Menu.";
-        if (startWithWindows) *message += L"\nIt will start with Windows.";
+        if (startWithWindows) *message += L"\nAdded to your Startup folder, so it starts with Windows.";
     }
     return true;
 }
 
 bool Uninstall(std::wstring* message) {
     SetStartWithWindows(false);
+    RemoveLegacyRunEntry();
 
     const std::wstring shortcut = ShortcutPath();
     if (!shortcut.empty()) DeleteFileW(shortcut.c_str());
@@ -154,45 +175,35 @@ bool Uninstall(std::wstring* message) {
     }
 
     if (message) {
-        *message = L"Removed the Start Menu shortcut, the startup entry and the settings." + note;
+        *message = L"Removed the Start Menu and Startup shortcuts and the settings." + note;
     }
     return true;
 }
 
 bool StartsWithWindows() {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_READ, &key) != ERROR_SUCCESS) return false;
-    const LSTATUS status = RegQueryValueExW(key, kAppName, nullptr, nullptr, nullptr, nullptr);
-    RegCloseKey(key);
-    return status == ERROR_SUCCESS;
+    const std::wstring shortcut = StartupShortcutPath();
+    if (shortcut.empty()) return false;
+    return GetFileAttributesW(shortcut.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
 bool SetStartWithWindows(bool enabled) {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_WRITE, &key) != ERROR_SUCCESS) {
-        return false;
+    RemoveLegacyRunEntry();
+
+    const std::wstring shortcut = StartupShortcutPath();
+    if (shortcut.empty()) return false;
+
+    if (!enabled) {
+        return DeleteFileW(shortcut.c_str()) ||
+               GetFileAttributesW(shortcut.c_str()) == INVALID_FILE_ATTRIBUTES;
     }
 
-    bool ok = false;
-    if (enabled) {
-        // Prefer the installed copy: a shortcut to wherever it was downloaded
-        // would break the moment that file is moved.
-        std::wstring target = InstalledExePath();
-        DWORD attributes = target.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(target.c_str());
-        if (attributes == INVALID_FILE_ATTRIBUTES) target = ExecutablePath();
-
-        const std::wstring value = L"\"" + target + L"\"";
-        ok = RegSetValueExW(key, kAppName, 0, REG_SZ,
-                            reinterpret_cast<const BYTE*>(value.c_str()),
-                            static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t))) ==
-             ERROR_SUCCESS;
-    } else {
-        const LSTATUS status = RegDeleteValueW(key, kAppName);
-        ok = status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND;
+    // Point at the installed copy where there is one: a shortcut to whatever
+    // folder it was downloaded into breaks as soon as that file moves.
+    std::wstring target = InstalledExePath();
+    if (target.empty() || GetFileAttributesW(target.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        target = ExecutablePath();
     }
-
-    RegCloseKey(key);
-    return ok;
+    return WriteShortcut(target, shortcut);
 }
 
 }  // namespace ma

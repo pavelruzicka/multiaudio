@@ -99,8 +99,11 @@ void PrintUsage() {
         "  --to <name>            Only mirror to devices matching <name>.\n"
         "                         May be given more than once.\n"
         "  --exclude <name>       Never mirror to devices matching <name>.\n"
-        "  --latency <ms>         How far the mirrored devices lag the source,\n"
-        "                         5-500. Default: 40.\n"
+        "  --latency <ms>         Buffering budget in milliseconds, 5-500.\n"
+        "                         Default: 40. Split between our own buffer and\n"
+        "                         the device queue; both have floors, so the\n"
+        "                         real figure lands near 35-45 ms at best and is\n"
+        "                         reported once mirroring starts.\n"
         "  --no-follow-default    Do not follow changes of the default device.\n"
         "  --verbose              Print extra detail.\n"
         "\n"
@@ -152,8 +155,8 @@ void ReportStatus(const ma::EngineStatus& status) {
         case ma::EngineState::Mirroring:
             break;
     }
-    ma::LogInfo("Mirroring %s to %zu device%s:", ma::Utf8(status.source).c_str(),
-                status.sinks.size(), status.sinks.size() == 1 ? "" : "s");
+    ma::LogInfo("Mirroring %s to %zu device%s, %d ms behind:", ma::Utf8(status.source).c_str(),
+                status.sinks.size(), status.sinks.size() == 1 ? "" : "s", status.latencyMs);
     for (const auto& sink : status.sinks) {
         ma::LogInfo("  -> %s", ma::Utf8(sink).c_str());
     }

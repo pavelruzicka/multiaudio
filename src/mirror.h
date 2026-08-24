@@ -43,11 +43,12 @@ struct EngineStatus {
     EngineState state = EngineState::Off;
     std::wstring source;
     std::vector<std::wstring> sinks;
+    int latencyMs = 0;     // what the destinations are actually behind by
     std::wstring message;  // why it is waiting
 
     bool operator==(const EngineStatus& other) const {
         return state == other.state && source == other.source && sinks == other.sinks &&
-               message == other.message;
+               latencyMs == other.latencyMs && message == other.message;
     }
     bool operator!=(const EngineStatus& other) const { return !(*this == other); }
 };
