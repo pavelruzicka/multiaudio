@@ -9,6 +9,8 @@
 #include <cstddef>
 #include <string>
 
+#include "channel_map.h"  // MapChannels, kept separate so it can be tested
+
 namespace ma {
 
 enum class SampleType { Unsupported, Float32, Int16, Int24, Int32 };
@@ -30,11 +32,5 @@ std::string FormatSummary(const StreamFormat& format);
 // PCM bytes -> interleaved float32, and back. `frames` counts frames, not samples.
 void ConvertToFloat(const void* src, const StreamFormat& format, size_t frames, float* dst);
 void ConvertFromFloat(const float* src, size_t frames, const StreamFormat& format, void* dst);
-
-// Interleaved float32 srcChannels -> dstChannels. Handles the common cases
-// (mono/stereo/surround) and falls back to a straight copy of the channels
-// that both sides have.
-void MapChannels(const float* src, unsigned srcChannels, float* dst, unsigned dstChannels,
-                 size_t frames);
 
 }  // namespace ma

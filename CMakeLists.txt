@@ -26,10 +26,11 @@ else()
     message(STATUS "Not Windows: building the resampler test only.")
 endif()
 
-# The resampler and ring buffer are plain arithmetic and build anywhere.
+# The resampler, channel map and ring buffer are plain arithmetic: they build
+# and run anywhere, including on the machine that cross-compiles the exe.
 enable_testing()
-add_executable(resampler_test tests/resampler_test.cpp)
+add_executable(audio_test tests/audio_test.cpp)
 if(NOT MSVC)
-    target_compile_options(resampler_test PRIVATE -Wall -Wextra)
+    target_compile_options(audio_test PRIVATE -Wall -Wextra)
 endif()
-add_test(NAME resampler COMMAND resampler_test)
+add_test(NAME audio COMMAND audio_test)

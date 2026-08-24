@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "channel_map.h"
 #include "resampler.h"
 #include "ring_buffer.h"
 

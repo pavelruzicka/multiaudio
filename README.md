@@ -133,11 +133,11 @@ Windows 7 or newer (Vista-era APIs only), 32- or 64-bit.
 
 ### Tests
 
-The resampler and the ring buffer are plain arithmetic, so they are tested on
-their own and the test builds on any platform:
+The resampler, the channel map and the ring buffer are plain arithmetic, so
+they are tested on their own and the test builds on any platform:
 
 ```
-g++ -std=c++17 -O2 -o resampler_test tests/resampler_test.cpp && ./resampler_test
+g++ -std=c++17 -O2 -o audio_test tests/audio_test.cpp && ./audio_test
 ```
 
 It checks that resampling stays continuous across block boundaries (no gaps,

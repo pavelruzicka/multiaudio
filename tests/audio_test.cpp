@@ -1,8 +1,8 @@
 // Tests for the parts of multiaudio that are just arithmetic: the drift
-// resampler and the ring buffer. Both headers are free of Windows types, so
-// this builds and runs anywhere:
+// resampler, the channel map and the ring buffer. These headers are free of
+// Windows types, so this builds and runs anywhere:
 //
-//     g++ -std=c++17 -O2 -o resampler_test tests/resampler_test.cpp && ./resampler_test
+//     g++ -std=c++17 -O2 -o audio_test tests/audio_test.cpp && ./audio_test
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +10,7 @@
 #include <deque>
 #include <vector>
 
+#include "../src/channel_map.h"
 #include "../src/resampler.h"
 #include "../src/ring_buffer.h"
 
@@ -37,11 +38,18 @@ public:
     // them (and their interpolations) exactly; the test skips the wraps.
     static constexpr int kRampPeriod = 251;
 
+    // Each channel gets its own offset, so a channel that is dropped,
+    // duplicated or swapped shows up rather than hiding behind an identical
+    // neighbour.
+    static constexpr float kChannelOffset = 1000.0f;
+
     void produceRamp(size_t frames) {
         for (size_t i = 0; i < frames; ++i) {
             const float value = static_cast<float>(counter_ % kRampPeriod);
             ++counter_;
-            for (unsigned c = 0; c < channels_; ++c) data_.push_back(value);
+            for (unsigned c = 0; c < channels_; ++c) {
+                data_.push_back(value + static_cast<float>(c) * kChannelOffset);
+            }
         }
     }
 
@@ -117,7 +125,9 @@ void TestRampContinuity(unsigned sourceRate, unsigned destRate, const char* labe
         }
 
         for (size_t i = 0; i < kBlock; ++i) {
-            if (out[i * kChannels] != out[i * kChannels + 1]) channelsMatch = false;
+            const double gap = static_cast<double>(out[i * kChannels + 1]) -
+                               static_cast<double>(out[i * kChannels]);
+            if (std::fabs(gap - SourceQueue::kChannelOffset) > 0.01) channelsMatch = false;
             history.push_back(out[i * kChannels]);
             steps.push_back(resampler.lastStep());
             restarts.push_back(restarted ? 1 : 0);
@@ -145,7 +155,7 @@ void TestRampContinuity(unsigned sourceRate, unsigned destRate, const char* labe
     printf("%s: %zu samples compared, worst step error %.6f (step %.6f)\n", label, compared,
            worstError, static_cast<double>(sourceRate) / destRate);
     Check(compared > 100000, "produced a long continuous stream");
-    Check(channelsMatch, "both channels carry the same interpolated values");
+    Check(channelsMatch, "channels stay separate and correctly interleaved");
     Check(worstError < 0.001, "no gaps, repeats or jumps between blocks");
 }
 
@@ -324,10 +334,80 @@ void TestRingBuffer() {
     Check(ring.read(out, 4) == 0, "empty ring reads nothing");
 }
 
+// The channel map is what stands between a stereo source and a device with a
+// different layout. A bug here is heard as one silent side, so every case
+// checks that left and right both survive and stay on their own side.
+void TestChannelMap() {
+    // Two frames, left and right clearly distinct.
+    const float stereo[4] = {-0.5f, 0.25f, -0.75f, 0.5f};
+    float out[16] = {0};
+
+    ma::MapChannels(stereo, 2, out, 2, 2);
+    Check(out[0] == -0.5f && out[1] == 0.25f && out[2] == -0.75f && out[3] == 0.5f,
+          "stereo to stereo is untouched");
+
+    // Into a 5.1 or 7.1 device: the front pair carries the audio, the rest is
+    // silent. Both sides must still be there.
+    for (unsigned channels : {6u, 8u}) {
+        std::vector<float> wide(channels * 2, 99.0f);
+        ma::MapChannels(stereo, 2, wide.data(), channels, 2);
+        bool restSilent = true;
+        for (unsigned c = 2; c < channels; ++c) {
+            if (wide[c] != 0.0f || wide[channels + c] != 0.0f) restSilent = false;
+        }
+        Check(wide[0] == -0.5f && wide[1] == 0.25f, "stereo keeps both sides on a wide device");
+        Check(wide[channels] == -0.75f && wide[channels + 1] == 0.5f,
+              "stereo stays aligned on later frames of a wide device");
+        Check(restSilent, "unused channels of a wide device are silent");
+    }
+
+    // Mono source into a stereo device: both ears, not just the left.
+    const float mono[2] = {0.5f, -0.25f};
+    ma::MapChannels(mono, 1, out, 2, 2);
+    Check(out[0] == 0.5f && out[1] == 0.5f, "mono reaches both ears");
+    Check(out[2] == -0.25f && out[3] == -0.25f, "mono reaches both ears on later frames");
+
+    // Stereo into a mono device: the average, with neither side dropped.
+    const float pair[2] = {1.0f, 0.0f};
+    ma::MapChannels(pair, 2, out, 1, 1);
+    Check(out[0] == 0.5f, "stereo folds to mono without dropping a side");
+
+    // 5.1 down to headphones: audio present only on the left of the source
+    // must stay left, and the centre must reach both.
+    const float left51[6] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};    // FL only
+    const float centre51[6] = {0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f};  // FC only
+    const float lfe51[6] = {0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};     // LFE only
+    ma::MapChannels(left51, 6, out, 2, 1);
+    Check(out[0] == 1.0f && out[1] == 0.0f, "5.1 front left stays left");
+    ma::MapChannels(centre51, 6, out, 2, 1);
+    Check(out[0] > 0.7f && out[0] == out[1], "5.1 centre reaches both sides equally");
+    ma::MapChannels(lfe51, 6, out, 2, 1);
+    Check(out[0] == 0.0f && out[1] == 0.0f, "5.1 LFE is dropped, not mixed in");
+
+    // Quad: channels 2 and 3 are the back pair, not a centre.
+    const float quad[4] = {0.0f, 0.0f, 1.0f, 0.0f};  // back left only
+    ma::MapChannels(quad, 4, out, 2, 1);
+    Check(out[0] > 0.7f && out[1] == 0.0f, "quad back left stays left");
+
+    // 7.1 sides.
+    float surround[8] = {0};
+    surround[7] = 1.0f;  // side right only
+    ma::MapChannels(surround, 8, out, 2, 1);
+    Check(out[0] == 0.0f && out[1] > 0.7f, "7.1 side right stays right");
+
+    // An unusual layout must not silence a side either.
+    const float odd[5] = {0.5f, 0.25f, 0.1f, 0.1f, 0.1f};
+    ma::MapChannels(odd, 5, out, 2, 1);
+    Check(out[0] > 0.0f && out[1] > 0.0f, "an odd layout still feeds both sides");
+}
+
 }  // namespace
 
 int main() {
-    printf("ring buffer\n");
+    printf("channel map\n");
+    TestChannelMap();
+
+    printf("\nring buffer\n");
     TestRingBuffer();
 
     printf("\nramp continuity\n");
